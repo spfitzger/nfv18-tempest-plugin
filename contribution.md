@@ -11,7 +11,8 @@ Please, follow the instructions below to meet the project contribution guide lin
     - Create a virtualenv, activate and install the requirements and test-requirements:
         $ virtualenv /tmp/nfv-tempest-plugin_venv
         $ source /tmp/nfv-tempest-plugin_venv/bin/activate
-        $ pip install .
+        $ pip install -r requirements-dev.txt -r test-requirements.txt
+        $ pip install -e .
     - Add gerrithub remote to your repo:
       **Note** - Make sure to set your GitHub username in the command below:
         $ git remote add gerrit ssh://<your_ssh_username>@review.gerrithub.io:29418/redhat-openstack/nfv-tempest-plugin.git

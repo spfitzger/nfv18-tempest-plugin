@@ -1,14 +1,12 @@
-configparser >= 3.5.0
-envbash===1.2.0
-openstacksdk===1.0.2
-python-heatclient===3.2.0
-python-keystoneclient===5.1.0
-python-novaclient===18.3.0
-redfish
-paramiko===2.11.0
-requests>=2.25.0
-jsonschema===4.16.0 # MIT
-cryptography===38.0.2
-tempest>=27.0.0 # Apache-2.0
-neutron_tempest_plugin>=0.9.0 # Apache-2.0
-openshift
+# Intentionally empty.
+#
+# pbr maps this file to install_requires. When test-operator installs the
+# plugin via externalPlugin (`pip install .` in the tempest pod), any pins
+# here force pip to contact a package index. Lab egress often returns an
+# Anubis/bot-check HTML page instead of package metadata, which pip then
+# mis-parses as a PEP 508 marker (InvalidMarker: "re not a bot!...").
+#
+# RHOSO openstack-tempest-all already provides tempest, clients, paramiko,
+# requests, etc. Register the plugin only; do not re-resolve deps at runtime.
+#
+# For local development: pip install -r requirements-dev.txt && pip install -e .

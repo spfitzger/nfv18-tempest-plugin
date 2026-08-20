@@ -268,38 +268,51 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             return 'sudo -n'
         return ''
 
-    def _add_guest_tc_loss(self, ssh_client, mac_address, loss_percent):
-        """Use tc netem to inject packet loss on the guest dataplane interface."""
+    def _add_guest_iptables_drop(self, ssh_client, mac_address, direction, probability):
+        """Use iptables statistic module to randomly drop packets.
+
+        direction: 'INPUT' for RX drops, 'OUTPUT' for TX drops
+        probability: 0.0-1.0 (e.g., 0.5 for 50% drop rate)
+        """
         sudo = self._guest_sudo_prefix(ssh_client)
         if not sudo:
             raise RuntimeError(
-                'Passwordless sudo required on guest to add tc loss for drop induction')
+                'Passwordless sudo required on guest for iptables drop induction')
         iface = self._guest_dataplane_iface(ssh_client, mac_address)
-        # Clear any existing qdisc first
-        ssh_client.exec_command(
-            '%s tc qdisc del dev %s root 2>/dev/null || true' % (sudo, iface))
-        # Add netem with packet loss
-        ssh_client.exec_command(
-            '%s tc qdisc add dev %s root netem loss %d%%' % (
-                sudo, iface, loss_percent))
+        # Add iptables rule to randomly drop packets
+        if direction == 'INPUT':
+            cmd = ('%s iptables -I %s -i %s -m statistic --mode random '
+                   '--probability %.2f -j DROP' % (
+                       sudo, direction, iface, probability))
+        else:  # OUTPUT
+            cmd = ('%s iptables -I %s -o %s -m statistic --mode random '
+                   '--probability %.2f -j DROP' % (
+                       sudo, direction, iface, probability))
+        ssh_client.exec_command(cmd)
         return iface
 
-    def _remove_guest_tc_loss(self, ssh_client, mac_address):
-        """Remove tc netem packet loss from guest dataplane interface."""
+    def _remove_guest_iptables_drop(self, ssh_client, mac_address, direction):
+        """Remove iptables drop rules from guest dataplane interface."""
         sudo = self._guest_sudo_prefix(ssh_client)
         if not sudo:
             return
         iface = self._lookup_guest_dataplane_iface_by_mac(ssh_client, mac_address)
         if iface:
-            ssh_client.exec_command(
-                '%s tc qdisc del dev %s root 2>/dev/null || true' % (sudo, iface))
+            # Delete all matching rules (may be multiple if test was interrupted)
+            if direction == 'INPUT':
+                cmd = ('%s iptables -D %s -i %s -m statistic --mode random -j DROP '
+                       '2>/dev/null || true' % (sudo, direction, iface))
+            else:  # OUTPUT
+                cmd = ('%s iptables -D %s -o %s -m statistic --mode random -j DROP '
+                       '2>/dev/null || true' % (sudo, direction, iface))
+            ssh_client.exec_command(cmd)
 
     def _induce_transmit_drops(self, ctx, count, min_packets):
-        """Use tc netem to inject TX packet loss on the sender guest.
+        """Use iptables to randomly drop outgoing packets on the sender guest.
 
-        Applies a 50% packet loss rate using tc netem on the guest's
-        dataplane interface, then sends traffic. The kernel's traffic
-        control layer drops packets before they reach the NIC, which
+        Applies a 50% drop probability using iptables OUTPUT chain with the
+        statistic module on the guest's dataplane interface, then sends traffic.
+        The kernel drops packets before they reach the NIC driver, which
         increments the interface's TX drop counter.
         """
         sender = ctx['sender']
@@ -312,13 +325,14 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_flood_packets)
 
-        self._add_guest_tc_loss(ssh_sender, mac_address, 50)
-        self.addCleanup(self._remove_guest_tc_loss, ssh_sender, mac_address)
+        self._add_guest_iptables_drop(ssh_sender, mac_address, 'OUTPUT', 0.5)
+        self.addCleanup(
+            self._remove_guest_iptables_drop, ssh_sender, mac_address, 'OUTPUT')
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
         LOG.warning(
-            'Inducing transmit drops on %s VF %s: tc netem 50%% loss, '
+            'Inducing transmit drops on %s VF %s: iptables OUTPUT 50%% drop, '
             '%d UDP datagrams %s -> %s (host tx_dropped=%s)',
             hypervisor_ip, vf_labels, flood_count, bind_ip, peer_ip,
             sysfs_before)
@@ -443,11 +457,11 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         self._run_guest_python_script(ssh_client, script, timeout_sec=120)
 
     def _induce_receive_drops(self, ctx, count, min_packets):
-        """Use tc netem to inject RX packet loss on the receiver guest.
+        """Use iptables to randomly drop incoming packets on the receiver guest.
 
-        Applies a 50% packet loss rate using tc netem on the receiver's
-        dataplane interface, then sends traffic from the peer. The kernel's
-        traffic control layer drops incoming packets on the RX path, which
+        Applies a 50% drop probability using iptables INPUT chain with the
+        statistic module on the receiver's dataplane interface, then sends
+        traffic from the peer. The kernel drops packets on the RX path, which
         increments the interface's RX drop counter.
         """
         if ':' in ctx['peer_ip']:
@@ -462,13 +476,14 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_packets)
 
-        self._add_guest_tc_loss(ctx['ssh_receiver'], mac_address, 50)
-        self.addCleanup(self._remove_guest_tc_loss, ctx['ssh_receiver'], mac_address)
+        self._add_guest_iptables_drop(ctx['ssh_receiver'], mac_address, 'INPUT', 0.5)
+        self.addCleanup(
+            self._remove_guest_iptables_drop, ctx['ssh_receiver'], mac_address, 'INPUT')
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(
-            'Inducing receive drops on %s VF %s: tc netem 50%% loss, '
+            'Inducing receive drops on %s VF %s: iptables INPUT 50%% drop, '
             '%d UDP datagrams %s -> %s (host rx_dropped=%s)',
             hypervisor_ip, vf_labels, flood_count, bind_ip,
             ctx['peer_ip'], sysfs_before)

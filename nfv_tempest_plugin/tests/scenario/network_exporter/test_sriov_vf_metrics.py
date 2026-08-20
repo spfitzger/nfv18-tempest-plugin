@@ -15,7 +15,6 @@
 #    under the License.
 
 import base64
-import shlex
 import time
 import unittest
 
@@ -269,83 +268,38 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             return 'sudo -n'
         return ''
 
-    def _set_hypervisor_vf_link_state(self, hypervisor_ip, vf_labels, enabled):
-        """Enable or disable SR-IOV VF link state from the compute hypervisor."""
-        state = 'enable' if enabled else 'disable'
+    def _set_hypervisor_vf_rate_limit(self, hypervisor_ip, vf_labels,
+                                      rate_mbps):
+        """Cap (or clear with 0) a VF's egress rate limit in Mbit/s.
+
+        Unlike admin link-state, this keeps the VF fully up on both host
+        and guest, so traffic actually reaches the hardware policer instead
+        of being refused at the carrier layer (driver-dependent behavior
+        that made link-state toggling an unreliable way to induce
+        tx_dropped).
+        """
         pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
-        cmd = 'sudo ip link set dev %s vf %s state %s' % (
-            pf_netdev, vf_labels['vf'], state)
+        cmd = 'sudo ip link set dev %s vf %s rate %d' % (
+            pf_netdev, vf_labels['vf'], rate_mbps)
         self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
 
-    def _restore_hypervisor_vf_link(self, hypervisor_ip, vf_labels):
-        """Best-effort re-enable of VF link state after transmit drop test."""
+    def _restore_hypervisor_vf_rate_limit(self, hypervisor_ip, vf_labels):
+        """Best-effort clear of the VF rate limit after the transmit drop test."""
         pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
         self._ssh_run_unchecked_on_hypervisor(
             hypervisor_ip,
-            'sudo ip link set dev %s vf %s state enable' % (
+            'sudo ip link set dev %s vf %s rate 0' % (
                 pf_netdev, vf_labels['vf']))
 
-    def _hypervisor_vf_link_state(self, hypervisor_ip, vf_labels):
-        """Return VF link-state string from ``ip link`` (enable/disable/auto)."""
-        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
-        script = (
-            'PF=%s VF=%s python3 - <<\'PY\'\n'
-            'import os, re, subprocess\n'
-            'pf = os.environ["PF"]\n'
-            'vf = os.environ["VF"]\n'
-            'try:\n'
-            '    out = subprocess.check_output(\n'
-            '        ["ip", "-s", "link", "show", "dev", pf],\n'
-            '        text=True, stderr=subprocess.DEVNULL)\n'
-            'except Exception:\n'
-            '    raise SystemExit(0)\n'
-            'for part in re.split(r"(?m)(?=^\\s*vf\\s+\\d+)", out):\n'
-            '    m = re.match(r"\\s*vf\\s+(\\d+)\\b", part)\n'
-            '    if not m or m.group(1) != vf:\n'
-            '        continue\n'
-            '    m2 = re.search(r"link-state\\s+(\\w+)", part)\n'
-            '    if m2:\n'
-            '        print(m2.group(1))\n'
-            '    break\n'
-            'PY' % (
-                shlex.quote(pf_netdev),
-                shlex.quote(str(vf_labels['vf']))))
-        lines = self._ssh_run_unchecked_on_hypervisor(
-            hypervisor_ip, script).strip().splitlines()
-        return lines[-1].strip() if lines else ''
-
-    def _set_guest_dataplane_iface_state(self, ssh_client, mac_address, up):
-        """Bring the guest SR-IOV dataplane iface up or down (needs sudo)."""
-        sudo = self._guest_sudo_prefix(ssh_client)
-        if not sudo:
-            raise RuntimeError(
-                'Passwordless sudo required on the guest to toggle the '
-                'SR-IOV dataplane interface for drop induction')
-        iface = self._guest_dataplane_iface(ssh_client, mac_address)
-        state = 'up' if up else 'down'
-        ssh_client.exec_command('%s ip link set dev %s %s' % (
-            sudo, iface, state))
-        return iface
-
-    def _restore_guest_dataplane_iface(self, ssh_client, mac_address):
-        """Best-effort bring-up of the guest SR-IOV dataplane iface."""
-        try:
-            sudo = self._guest_sudo_prefix(ssh_client)
-            if not sudo:
-                return
-            iface = self._lookup_guest_dataplane_iface_by_mac(
-                ssh_client, mac_address)
-            if not iface:
-                return
-            ssh_client.exec_command(
-                '%s ip link set dev %s up' % (sudo, iface))
-        except Exception as exc:
-            LOG.warning(
-                'Failed to restore guest dataplane iface for MAC %s: %s',
-                mac_address, exc)
-
     def _induce_transmit_drops(self, ctx, count, min_packets):
-        """Disable host VF link and flood TX from guest (iface stays up)."""
+        """Cap the sender VF egress rate and flood well above it.
+
+        Rate-limiting is a hardware policing feature every SR-IOV driver
+        (ixgbe, i40e, mlx5, bnxt) implements, so excess traffic is reliably
+        dropped and counted in tx_dropped. The VF stays administratively up
+        end-to-end, avoiding the driver-dependent carrier behavior that made
+        link-state toggling an unreliable way to induce drops.
+        """
         sender = ctx['sender']
         hypervisor_ip = sender['hypervisor_ip']
         vf_labels = sender['vf_labels']
@@ -355,34 +309,29 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         ssh_sender = ctx['ssh_sender']
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_flood_packets)
+        rate_limit_mbps = (
+            CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_rate_mbps)
 
         self.addCleanup(
-            self._restore_hypervisor_vf_link, hypervisor_ip, vf_labels)
+            self._restore_hypervisor_vf_rate_limit, hypervisor_ip, vf_labels)
         self._maybe_shrink_guest_tx_ring(ssh_sender, mac_address)
-        self._set_hypervisor_vf_link_state(
-            hypervisor_ip, vf_labels, False)
-        time.sleep(2)
-        link_state = self._hypervisor_vf_link_state(hypervisor_ip, vf_labels)
-        if link_state and link_state != 'disable':
-            LOG.warning(
-                'Host VF link-state is %r after disable on %s labels %s; '
-                'continuing flood and requiring Prometheus increase',
-                link_state, hypervisor_ip, vf_labels)
+        self._set_hypervisor_vf_rate_limit(
+            hypervisor_ip, vf_labels, rate_limit_mbps)
+        time.sleep(1)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
         LOG.warning(
-            'Inducing transmit drops on %s VF %s: host link disabled '
-            '(link-state=%r), guest iface up, %d UDP datagrams %s -> %s '
-            '(host tx_dropped=%s)',
-            hypervisor_ip, vf_labels, link_state or 'unknown', flood_count,
+            'Inducing transmit drops on %s VF %s: rate-limited to %d Mbit/s, '
+            '%d UDP datagrams %s -> %s (host tx_dropped=%s)',
+            hypervisor_ip, vf_labels, rate_limit_mbps, flood_count,
             bind_ip, peer_ip, sysfs_before)
         self._flood_udp_dataplane(
             ssh_sender, bind_ip, peer_ip, flood_count)
         time.sleep(1)
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
-        self._restore_hypervisor_vf_link(hypervisor_ip, vf_labels)
+        self._restore_hypervisor_vf_rate_limit(hypervisor_ip, vf_labels)
         LOG.warning(
             'Transmit drop induce finished on %s VF %s: host tx_dropped '
             'before=%s after=%s',
@@ -439,33 +388,53 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         return iface
 
     def _flood_udp_dataplane(self, ssh_client, bind_ip, dest_ip, packet_count,
-                             broadcast=False):
-        """Send a UDP flood bound to the SR-IOV guest IP."""
+                             broadcast=False, threads=1):
+        """Send a UDP flood bound to the SR-IOV guest IP.
+
+        ``threads`` runs multiple concurrent senders (Python threads release
+        the GIL around the blocking ``sendto`` syscall) to raise the burst
+        packet rate beyond what one sender can sustain, e.g. to overrun a
+        shrunk receiver RX ring.
+        """
         bcast = 'True' if broadcast else 'False'
+        threads = max(1, threads)
         script = (
             'import socket\n'
-            's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
-            'if %s:\n'
-            '    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)\n'
-            's.bind((%r, 0))\n'
-            'payload = b"x" * 1400\n'
-            'dest = (%r, 9999)\n'
-            'for _ in range(%d):\n'
-            '    try:\n'
-            '        s.sendto(payload, dest)\n'
-            '    except OSError:\n'
-            '        pass\n'
-            % (bcast, bind_ip, dest_ip, packet_count))
+            'import threading\n'
+            'def _send(n):\n'
+            '    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+            '    if %s:\n'
+            '        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)\n'
+            '    s.bind((%r, 0))\n'
+            '    payload = b"x" * 1400\n'
+            '    dest = (%r, 9999)\n'
+            '    for _ in range(n):\n'
+            '        try:\n'
+            '            s.sendto(payload, dest)\n'
+            '        except OSError:\n'
+            '            pass\n'
+            'workers = [threading.Thread(target=_send, args=(%d,))\n'
+            '           for _ in range(%d)]\n'
+            'for w in workers:\n'
+            '    w.start()\n'
+            'for w in workers:\n'
+            '    w.join()\n'
+            % (bcast, bind_ip, dest_ip, packet_count // threads, threads))
         self._run_guest_python_script(ssh_client, script, timeout_sec=120)
 
     def _induce_receive_drops(self, ctx, count, min_packets):
-        """Disable host VF link and guest RX path, then flood from the peer.
+        """Starve the receiver VF's RX ring, then flood it with concurrent senders.
 
         Socket-level "no listener" drops do not increment host VF
-        ``rx_dropped`` / ``net_vf_receive_dropped_total``. Disabling the
-        host VF link (and taking the guest dataplane iface down when sudo
-        allows) is intended to make the PF count drops for frames aimed at
-        that VF.
+        ``rx_dropped`` / ``net_vf_receive_dropped_total`` (the NIC has
+        already accepted and counted the frame before the kernel discards
+        it at the socket layer). Toggling the host VF link or guest iface
+        admin state doesn't help either: several drivers simply refuse to
+        attempt delivery while link/carrier is down, so nothing gets counted
+        as dropped. Instead, shrink the guest RX ring to its minimum and
+        flood well beyond what the guest can drain, so the NIC hits a real
+        no-descriptor overrun -- every SR-IOV driver counts that as
+        rx_dropped, and the VF stays administratively up throughout.
         """
         if ':' in ctx['peer_ip']:
             self.fail(
@@ -478,44 +447,24 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         bind_ip = ctx['sender']['port']['fixed_ips'][0]['ip_address']
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_packets)
+        flood_threads = (
+            CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_threads)
         self._maybe_shrink_guest_rx_ring(ctx['ssh_receiver'], mac_address)
-
-        self.addCleanup(
-            self._restore_hypervisor_vf_link, hypervisor_ip, vf_labels)
-        self._set_hypervisor_vf_link_state(
-            hypervisor_ip, vf_labels, False)
-        time.sleep(1)
-        link_state = self._hypervisor_vf_link_state(hypervisor_ip, vf_labels)
-
-        iface = None
-        try:
-            iface = self._set_guest_dataplane_iface_state(
-                ctx['ssh_receiver'], mac_address, up=False)
-            self.addCleanup(
-                self._restore_guest_dataplane_iface,
-                ctx['ssh_receiver'], mac_address)
-        except (RuntimeError, unittest.SkipTest) as exc:
-            LOG.warning(
-                'Guest dataplane down unavailable for RX drop induce on %s '
-                '(%s); continuing with host VF link-state=%r only',
-                hypervisor_ip, exc, link_state or 'unknown')
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(
-            'Inducing receive drops on %s VF %s: host link-state=%r, '
-            'guest iface=%s, %d UDP datagrams %s -> %s (host rx_dropped=%s)',
-            hypervisor_ip, vf_labels, link_state or 'unknown',
-            iface or 'unchanged', flood_count, bind_ip, ctx['peer_ip'],
-            sysfs_before)
+            'Inducing receive drops on %s VF %s: RX ring shrunk, %d UDP '
+            'datagrams from %d concurrent senders %s -> %s '
+            '(host rx_dropped=%s)',
+            hypervisor_ip, vf_labels, flood_count, flood_threads, bind_ip,
+            ctx['peer_ip'], sysfs_before)
         self._flood_udp_dataplane(
-            ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count)
+            ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count,
+            threads=flood_threads)
         time.sleep(1)
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
-        if iface:
-            self._restore_guest_dataplane_iface(ctx['ssh_receiver'], mac_address)
-        self._restore_hypervisor_vf_link(hypervisor_ip, vf_labels)
         LOG.warning(
             'Receive drop induce finished on %s VF %s: host rx_dropped '
             'before=%s after=%s',
@@ -673,14 +622,14 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             metrics_base.NET_VF_TRANSMIT_DROPPED_METRIC)
 
     def test_z_net_vf_transmit_dropped_total_increases_with_traffic(self):
-        """Verify net_vf_transmit_dropped_total increases after TX link-down."""
+        """Verify net_vf_transmit_dropped_total increases after TX rate-limit."""
         self._test_vf_drop_counter_increases(
             metrics_base.NET_VF_TRANSMIT_DROPPED_METRIC, 'sender',
             traffic_generator=self._induce_transmit_drops,
             sysfs_stat_name='tx_dropped')
 
     def test_z_net_vf_receive_dropped_total_increases_with_traffic(self):
-        """Verify net_vf_receive_dropped_total increases after RX iface-down flood."""
+        """Verify net_vf_receive_dropped_total increases after RX ring overrun."""
         self._test_vf_drop_counter_increases(
             metrics_base.NET_VF_RECEIVE_DROPPED_METRIC, 'receiver',
             traffic_generator=self._induce_receive_drops,

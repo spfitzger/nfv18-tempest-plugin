@@ -142,14 +142,28 @@ NfvPluginOptions = [
                     'SR-IOV VF packet/byte counter growth.'),
     cfg.IntOpt('network_exporter_sriov_rx_drop_flood_packets',
                default=50000,
-               help='UDP datagrams sent at high rate to the SR-IOV peer while '
-                    'the receiver guest dataplane interface is down, to induce '
-                    'net_vf_receive_dropped_total increases on the receiver VF.'),
+               help='UDP datagrams sent at high rate, split across '
+                    'network_exporter_sriov_rx_drop_flood_threads concurrent '
+                    'senders, to the SR-IOV peer while its RX ring is shrunk '
+                    'to the minimum, to induce net_vf_receive_dropped_total '
+                    'increases on the receiver VF via a real ring overrun.'),
+    cfg.IntOpt('network_exporter_sriov_rx_drop_flood_threads',
+               default=4,
+               help='Concurrent UDP sender threads used when flooding for '
+                    'net_vf_receive_dropped_total, to raise the burst packet '
+                    'rate beyond what the receiver VF RX ring can drain.'),
     cfg.IntOpt('network_exporter_sriov_tx_drop_flood_packets',
                default=10000,
-               help='UDP datagrams sent from the SR-IOV guest while the host '
-                    'VF link is disabled, to induce net_vf_transmit_dropped_total '
-                    'increases on the sender VF.'),
+               help='UDP datagrams sent from the SR-IOV guest while the '
+                    'sender VF egress rate is capped to '
+                    'network_exporter_sriov_tx_drop_rate_mbps, to induce '
+                    'net_vf_transmit_dropped_total increases on the sender '
+                    'VF via hardware rate-limiting.'),
+    cfg.IntOpt('network_exporter_sriov_tx_drop_rate_mbps',
+               default=1,
+               help='VF egress rate limit (Mbit/s), set via '
+                    '"ip link set vf ... rate", applied to the sender VF '
+                    'while flooding traffic for net_vf_transmit_dropped_total.'),
     cfg.IntOpt('network_exporter_sriov_broadcast_flood_packets',
                default=150,
                help='UDP datagrams sent to the SR-IOV subnet broadcast address '

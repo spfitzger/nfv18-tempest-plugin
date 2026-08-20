@@ -142,16 +142,14 @@ NfvPluginOptions = [
                     'SR-IOV VF packet/byte counter growth.'),
     cfg.IntOpt('network_exporter_sriov_rx_drop_flood_packets',
                default=10000,
-               help='UDP datagrams sent to the SR-IOV peer while an iptables '
-                    'INPUT rule with 50%% random drop probability is applied '
-                    'to the receiver VF guest interface, to induce '
+               help='UDP datagrams sent to the SR-IOV peer while the receiver '
+                    'VF guest interface is toggled down/up, to induce '
                     'net_vf_receive_dropped_total increases on the receiver VF.'),
     cfg.IntOpt('network_exporter_sriov_tx_drop_flood_packets',
                default=10000,
-               help='UDP datagrams sent from the SR-IOV guest while an iptables '
-                    'OUTPUT rule with 50%% random drop probability is applied '
-                    'to the sender VF guest interface, to induce '
-                    'net_vf_transmit_dropped_total increases on the sender VF.'),
+               help='UDP datagrams sent from the SR-IOV guest to a blackhole '
+                    'route destination, to induce net_vf_transmit_dropped_total '
+                    'increases on the sender VF.'),
     cfg.IntOpt('network_exporter_sriov_broadcast_flood_packets',
                default=150,
                help='UDP datagrams sent to the SR-IOV subnet broadcast address '

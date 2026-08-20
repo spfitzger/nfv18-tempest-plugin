@@ -268,15 +268,39 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             return 'sudo -n'
         return ''
 
-    def _induce_transmit_drops(self, ctx, count, min_packets):
-        """Starve the sender VF's TX ring, then flood it with concurrent senders.
+    def _add_guest_tc_loss(self, ssh_client, mac_address, loss_percent):
+        """Use tc netem to inject packet loss on the guest dataplane interface."""
+        sudo = self._guest_sudo_prefix(ssh_client)
+        if not sudo:
+            raise RuntimeError(
+                'Passwordless sudo required on guest to add tc loss for drop induction')
+        iface = self._guest_dataplane_iface(ssh_client, mac_address)
+        # Clear any existing qdisc first
+        ssh_client.exec_command(
+            '%s tc qdisc del dev %s root 2>/dev/null || true' % (sudo, iface))
+        # Add netem with packet loss
+        ssh_client.exec_command(
+            '%s tc qdisc add dev %s root netem loss %d%%' % (
+                sudo, iface, loss_percent))
+        return iface
 
-        Shrinks the guest TX ring to its minimum (32-64 descriptors) and
-        floods well beyond what the ring can hold using multiple concurrent
-        Python threads. The goal is to overflow the TX ring before the NIC
-        can drain it, causing the driver to drop packets and count them in
-        tx_dropped. Every SR-IOV driver counts TX ring overruns as dropped,
-        and the VF stays administratively up throughout.
+    def _remove_guest_tc_loss(self, ssh_client, mac_address):
+        """Remove tc netem packet loss from guest dataplane interface."""
+        sudo = self._guest_sudo_prefix(ssh_client)
+        if not sudo:
+            return
+        iface = self._lookup_guest_dataplane_iface_by_mac(ssh_client, mac_address)
+        if iface:
+            ssh_client.exec_command(
+                '%s tc qdisc del dev %s root 2>/dev/null || true' % (sudo, iface))
+
+    def _induce_transmit_drops(self, ctx, count, min_packets):
+        """Use tc netem to inject TX packet loss on the sender guest.
+
+        Applies a 50% packet loss rate using tc netem on the guest's
+        dataplane interface, then sends traffic. The kernel's traffic
+        control layer drops packets before they reach the NIC, which
+        increments the interface's TX drop counter.
         """
         sender = ctx['sender']
         hypervisor_ip = sender['hypervisor_ip']
@@ -287,22 +311,18 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         ssh_sender = ctx['ssh_sender']
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_flood_packets)
-        flood_threads = (
-            CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_flood_threads)
 
-        self._maybe_shrink_guest_tx_ring(ssh_sender, mac_address)
+        self._add_guest_tc_loss(ssh_sender, mac_address, 50)
+        self.addCleanup(self._remove_guest_tc_loss, ssh_sender, mac_address)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
         LOG.warning(
-            'Inducing transmit drops on %s VF %s: TX ring shrunk, %d UDP '
-            'datagrams from %d concurrent senders %s -> %s '
-            '(host tx_dropped=%s)',
-            hypervisor_ip, vf_labels, flood_count, flood_threads, bind_ip,
-            peer_ip, sysfs_before)
-        self._flood_udp_dataplane(
-            ssh_sender, bind_ip, peer_ip, flood_count,
-            threads=flood_threads)
+            'Inducing transmit drops on %s VF %s: tc netem 50%% loss, '
+            '%d UDP datagrams %s -> %s (host tx_dropped=%s)',
+            hypervisor_ip, vf_labels, flood_count, bind_ip, peer_ip,
+            sysfs_before)
+        self._flood_udp_dataplane(ssh_sender, bind_ip, peer_ip, flood_count)
         time.sleep(1)
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
@@ -423,18 +443,12 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         self._run_guest_python_script(ssh_client, script, timeout_sec=120)
 
     def _induce_receive_drops(self, ctx, count, min_packets):
-        """Starve the receiver VF's RX ring, then flood it with concurrent senders.
+        """Use tc netem to inject RX packet loss on the receiver guest.
 
-        Socket-level "no listener" drops do not increment host VF
-        ``rx_dropped`` / ``net_vf_receive_dropped_total`` (the NIC has
-        already accepted and counted the frame before the kernel discards
-        it at the socket layer). Toggling the host VF link or guest iface
-        admin state doesn't help either: several drivers simply refuse to
-        attempt delivery while link/carrier is down, so nothing gets counted
-        as dropped. Instead, shrink the guest RX ring to its minimum and
-        flood well beyond what the guest can drain, so the NIC hits a real
-        no-descriptor overrun -- every SR-IOV driver counts that as
-        rx_dropped, and the VF stays administratively up throughout.
+        Applies a 50% packet loss rate using tc netem on the receiver's
+        dataplane interface, then sends traffic from the peer. The kernel's
+        traffic control layer drops incoming packets on the RX path, which
+        increments the interface's RX drop counter.
         """
         if ':' in ctx['peer_ip']:
             self.fail(
@@ -447,21 +461,19 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         bind_ip = ctx['sender']['port']['fixed_ips'][0]['ip_address']
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_packets)
-        flood_threads = (
-            CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_threads)
-        self._maybe_shrink_guest_rx_ring(ctx['ssh_receiver'], mac_address)
+
+        self._add_guest_tc_loss(ctx['ssh_receiver'], mac_address, 50)
+        self.addCleanup(self._remove_guest_tc_loss, ctx['ssh_receiver'], mac_address)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(
-            'Inducing receive drops on %s VF %s: RX ring shrunk, %d UDP '
-            'datagrams from %d concurrent senders %s -> %s '
-            '(host rx_dropped=%s)',
-            hypervisor_ip, vf_labels, flood_count, flood_threads, bind_ip,
+            'Inducing receive drops on %s VF %s: tc netem 50%% loss, '
+            '%d UDP datagrams %s -> %s (host rx_dropped=%s)',
+            hypervisor_ip, vf_labels, flood_count, bind_ip,
             ctx['peer_ip'], sysfs_before)
         self._flood_udp_dataplane(
-            ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count,
-            threads=flood_threads)
+            ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count)
         time.sleep(1)
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')

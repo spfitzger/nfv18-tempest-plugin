@@ -141,29 +141,17 @@ NfvPluginOptions = [
                     'network_exporter_sriov_traffic_ping_count when checking '
                     'SR-IOV VF packet/byte counter growth.'),
     cfg.IntOpt('network_exporter_sriov_rx_drop_flood_packets',
-               default=50000,
-               help='UDP datagrams sent at high rate, split across '
-                    'network_exporter_sriov_rx_drop_flood_threads concurrent '
-                    'senders, to the SR-IOV peer while its RX ring is shrunk '
-                    'to the minimum, to induce net_vf_receive_dropped_total '
-                    'increases on the receiver VF via a real ring overrun.'),
-    cfg.IntOpt('network_exporter_sriov_rx_drop_flood_threads',
-               default=4,
-               help='Concurrent UDP sender threads used when flooding for '
-                    'net_vf_receive_dropped_total, to raise the burst packet '
-                    'rate beyond what the receiver VF RX ring can drain.'),
+               default=10000,
+               help='UDP datagrams sent to the SR-IOV peer while tc netem '
+                    '50%% packet loss is applied to the receiver VF guest '
+                    'interface, to induce net_vf_receive_dropped_total '
+                    'increases on the receiver VF.'),
     cfg.IntOpt('network_exporter_sriov_tx_drop_flood_packets',
-               default=100000,
-               help='UDP datagrams sent at high rate, split across '
-                    'network_exporter_sriov_tx_drop_flood_threads concurrent '
-                    'senders, from the SR-IOV guest while its TX ring is shrunk '
-                    'to the minimum, to induce net_vf_transmit_dropped_total '
-                    'increases on the sender VF via TX ring overrun.'),
-    cfg.IntOpt('network_exporter_sriov_tx_drop_flood_threads',
-               default=8,
-               help='Concurrent UDP sender threads used when flooding for '
-                    'net_vf_transmit_dropped_total, to raise the burst packet '
-                    'rate beyond what the sender VF TX ring can drain.'),
+               default=10000,
+               help='UDP datagrams sent from the SR-IOV guest while tc netem '
+                    '50%% packet loss is applied to the sender VF guest '
+                    'interface, to induce net_vf_transmit_dropped_total '
+                    'increases on the sender VF.'),
     cfg.IntOpt('network_exporter_sriov_broadcast_flood_packets',
                default=150,
                help='UDP datagrams sent to the SR-IOV subnet broadcast address '

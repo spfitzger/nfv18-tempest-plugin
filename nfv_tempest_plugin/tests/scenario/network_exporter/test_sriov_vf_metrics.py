@@ -268,52 +268,36 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             return 'sudo -n'
         return ''
 
-    def _add_guest_iptables_drop(self, ssh_client, mac_address, direction, probability):
-        """Use iptables statistic module to randomly drop packets.
+    def _add_guest_blackhole_route(self, ssh_client, mac_address, dest_ip):
+        """Add a blackhole route to drop packets to a specific destination.
 
-        direction: 'INPUT' for RX drops, 'OUTPUT' for TX drops
-        probability: 0.0-1.0 (e.g., 0.5 for 50% drop rate)
+        Uses 'ip route add blackhole <dest>' which is universally available
+        in iproute2. Packets matching this route are dropped by the kernel
+        routing layer, incrementing TX drop counters.
         """
         sudo = self._guest_sudo_prefix(ssh_client)
         if not sudo:
             raise RuntimeError(
-                'Passwordless sudo required on guest for iptables drop induction')
-        iface = self._guest_dataplane_iface(ssh_client, mac_address)
-        # Add iptables rule to randomly drop packets
-        if direction == 'INPUT':
-            cmd = ('%s iptables -I %s -i %s -m statistic --mode random '
-                   '--probability %.2f -j DROP' % (
-                       sudo, direction, iface, probability))
-        else:  # OUTPUT
-            cmd = ('%s iptables -I %s -o %s -m statistic --mode random '
-                   '--probability %.2f -j DROP' % (
-                       sudo, direction, iface, probability))
-        ssh_client.exec_command(cmd)
-        return iface
+                'Passwordless sudo required on guest for blackhole route')
+        # Add blackhole route for the peer IP
+        ssh_client.exec_command(
+            '%s ip route add blackhole %s 2>/dev/null || true' % (sudo, dest_ip))
+        return dest_ip
 
-    def _remove_guest_iptables_drop(self, ssh_client, mac_address, direction):
-        """Remove iptables drop rules from guest dataplane interface."""
+    def _remove_guest_blackhole_route(self, ssh_client, dest_ip):
+        """Remove blackhole route."""
         sudo = self._guest_sudo_prefix(ssh_client)
-        if not sudo:
+        if not sudo or not dest_ip:
             return
-        iface = self._lookup_guest_dataplane_iface_by_mac(ssh_client, mac_address)
-        if iface:
-            # Delete all matching rules (may be multiple if test was interrupted)
-            if direction == 'INPUT':
-                cmd = ('%s iptables -D %s -i %s -m statistic --mode random -j DROP '
-                       '2>/dev/null || true' % (sudo, direction, iface))
-            else:  # OUTPUT
-                cmd = ('%s iptables -D %s -o %s -m statistic --mode random -j DROP '
-                       '2>/dev/null || true' % (sudo, direction, iface))
-            ssh_client.exec_command(cmd)
+        ssh_client.exec_command(
+            '%s ip route del blackhole %s 2>/dev/null || true' % (sudo, dest_ip))
 
     def _induce_transmit_drops(self, ctx, count, min_packets):
-        """Use iptables to randomly drop outgoing packets on the sender guest.
+        """Use ip route blackhole to drop outgoing packets on the sender guest.
 
-        Applies a 50% drop probability using iptables OUTPUT chain with the
-        statistic module on the guest's dataplane interface, then sends traffic.
-        The kernel drops packets before they reach the NIC driver, which
-        increments the interface's TX drop counter.
+        Adds a blackhole route for the peer IP on the guest's routing table.
+        Packets to that destination are dropped by the kernel routing layer
+        before reaching the NIC, which increments the interface's TX drop counter.
         """
         sender = ctx['sender']
         hypervisor_ip = sender['hypervisor_ip']
@@ -325,16 +309,15 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_flood_packets)
 
-        self._add_guest_iptables_drop(ssh_sender, mac_address, 'OUTPUT', 0.5)
-        self.addCleanup(
-            self._remove_guest_iptables_drop, ssh_sender, mac_address, 'OUTPUT')
+        self._add_guest_blackhole_route(ssh_sender, mac_address, peer_ip)
+        self.addCleanup(self._remove_guest_blackhole_route, ssh_sender, peer_ip)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
         LOG.warning(
-            'Inducing transmit drops on %s VF %s: iptables OUTPUT 50%% drop, '
+            'Inducing transmit drops on %s VF %s: blackhole route to %s, '
             '%d UDP datagrams %s -> %s (host tx_dropped=%s)',
-            hypervisor_ip, vf_labels, flood_count, bind_ip, peer_ip,
+            hypervisor_ip, vf_labels, peer_ip, flood_count, bind_ip, peer_ip,
             sysfs_before)
         self._flood_udp_dataplane(ssh_sender, bind_ip, peer_ip, flood_count)
         time.sleep(1)
@@ -457,12 +440,11 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         self._run_guest_python_script(ssh_client, script, timeout_sec=120)
 
     def _induce_receive_drops(self, ctx, count, min_packets):
-        """Use iptables to randomly drop incoming packets on the receiver guest.
+        """Toggle the receiver interface down/up rapidly while traffic flows.
 
-        Applies a 50% drop probability using iptables INPUT chain with the
-        statistic module on the receiver's dataplane interface, then sends
-        traffic from the peer. The kernel drops packets on the RX path, which
-        increments the interface's RX drop counter.
+        Bringing the interface down while packets are arriving should cause
+        the NIC/driver to drop incoming frames, incrementing rx_dropped.
+        This is a best-effort approach when tc/iptables aren't available.
         """
         if ':' in ctx['peer_ip']:
             self.fail(
@@ -476,20 +458,43 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_packets)
 
-        self._add_guest_iptables_drop(ctx['ssh_receiver'], mac_address, 'INPUT', 0.5)
-        self.addCleanup(
-            self._remove_guest_iptables_drop, ctx['ssh_receiver'], mac_address, 'INPUT')
+        sudo = self._guest_sudo_prefix(ctx['ssh_receiver'])
+        if not sudo:
+            raise unittest.SkipTest(
+                'RX drop induction requires passwordless sudo on receiver guest')
+        iface = self._guest_dataplane_iface(ctx['ssh_receiver'], mac_address)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(
-            'Inducing receive drops on %s VF %s: iptables INPUT 50%% drop, '
+            'Inducing receive drops on %s VF %s: toggling %s down/up during flood, '
             '%d UDP datagrams %s -> %s (host rx_dropped=%s)',
-            hypervisor_ip, vf_labels, flood_count, bind_ip,
+            hypervisor_ip, vf_labels, iface, flood_count, bind_ip,
             ctx['peer_ip'], sysfs_before)
-        self._flood_udp_dataplane(
-            ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count)
+
+        # Start flood in background, then toggle interface
+        import threading
+        flood_done = threading.Event()
+        def flood_worker():
+            self._flood_udp_dataplane(
+                ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count)
+            flood_done.set()
+
+        flood_thread = threading.Thread(target=flood_worker)
+        flood_thread.start()
+        time.sleep(0.5)  # Let flood start
+
+        # Toggle interface down/up a few times
+        for _ in range(3):
+            ctx['ssh_receiver'].exec_command('%s ip link set %s down' % (sudo, iface))
+            time.sleep(0.1)
+            ctx['ssh_receiver'].exec_command('%s ip link set %s up' % (sudo, iface))
+            time.sleep(0.2)
+
+        flood_done.wait(timeout=30)
+        flood_thread.join(timeout=5)
         time.sleep(1)
+
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(

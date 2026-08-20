@@ -268,36 +268,38 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             return 'sudo -n'
         return ''
 
-    def _add_guest_blackhole_route(self, ssh_client, mac_address, dest_ip):
-        """Add a blackhole route to drop packets to a specific destination.
-
-        Uses 'ip route add blackhole <dest>' which is universally available
-        in iproute2. Packets matching this route are dropped by the kernel
-        routing layer, incrementing TX drop counters.
-        """
+    def _set_guest_mtu(self, ssh_client, mac_address, mtu):
+        """Set MTU on guest dataplane interface, return original MTU."""
         sudo = self._guest_sudo_prefix(ssh_client)
         if not sudo:
             raise RuntimeError(
-                'Passwordless sudo required on guest for blackhole route')
-        # Add blackhole route for the peer IP
-        ssh_client.exec_command(
-            '%s ip route add blackhole %s 2>/dev/null || true' % (sudo, dest_ip))
-        return dest_ip
+                'Passwordless sudo required on guest to change MTU')
+        iface = self._guest_dataplane_iface(ssh_client, mac_address)
+        # Get current MTU
+        output = ssh_client.exec_command('cat /sys/class/net/%s/mtu' % iface)
+        original_mtu = int(output.strip()) if output.strip().isdigit() else 1500
+        # Set new MTU
+        ssh_client.exec_command('%s ip link set %s mtu %d' % (sudo, iface, mtu))
+        return original_mtu
 
-    def _remove_guest_blackhole_route(self, ssh_client, dest_ip):
-        """Remove blackhole route."""
+    def _restore_guest_mtu(self, ssh_client, mac_address, original_mtu):
+        """Restore original MTU on guest dataplane interface."""
         sudo = self._guest_sudo_prefix(ssh_client)
-        if not sudo or not dest_ip:
+        if not sudo:
             return
-        ssh_client.exec_command(
-            '%s ip route del blackhole %s 2>/dev/null || true' % (sudo, dest_ip))
+        iface = self._lookup_guest_dataplane_iface_by_mac(ssh_client, mac_address)
+        if iface and original_mtu:
+            ssh_client.exec_command(
+                '%s ip link set %s mtu %d 2>/dev/null || true' % (
+                    sudo, iface, original_mtu))
 
     def _induce_transmit_drops(self, ctx, count, min_packets):
-        """Use ip route blackhole to drop outgoing packets on the sender guest.
+        """Lower MTU on sender to cause TX drops when sending normal-sized packets.
 
-        Adds a blackhole route for the peer IP on the guest's routing table.
-        Packets to that destination are dropped by the kernel routing layer
-        before reaching the NIC, which increments the interface's TX drop counter.
+        Sets sender interface MTU to 576 bytes (minimum IPv4 MTU), then sends
+        1400-byte UDP packets. The kernel or NIC driver should fragment or drop
+        oversized packets, incrementing tx_dropped. This is a last-resort approach
+        when tc/iptables/ring-manipulation aren't available.
         """
         sender = ctx['sender']
         hypervisor_ip = sender['hypervisor_ip']
@@ -309,15 +311,16 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_flood_packets)
 
-        self._add_guest_blackhole_route(ssh_sender, mac_address, peer_ip)
-        self.addCleanup(self._remove_guest_blackhole_route, ssh_sender, peer_ip)
+        original_mtu = self._set_guest_mtu(ssh_sender, mac_address, 576)
+        self.addCleanup(
+            self._restore_guest_mtu, ssh_sender, mac_address, original_mtu)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
         LOG.warning(
-            'Inducing transmit drops on %s VF %s: blackhole route to %s, '
+            'Inducing transmit drops on %s VF %s: MTU=576, sending 1400-byte packets, '
             '%d UDP datagrams %s -> %s (host tx_dropped=%s)',
-            hypervisor_ip, vf_labels, peer_ip, flood_count, bind_ip, peer_ip,
+            hypervisor_ip, vf_labels, flood_count, bind_ip, peer_ip,
             sysfs_before)
         self._flood_udp_dataplane(ssh_sender, bind_ip, peer_ip, flood_count)
         time.sleep(1)
@@ -440,11 +443,12 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         self._run_guest_python_script(ssh_client, script, timeout_sec=120)
 
     def _induce_receive_drops(self, ctx, count, min_packets):
-        """Toggle the receiver interface down/up rapidly while traffic flows.
+        """Lower MTU on receiver to cause RX drops when receiving normal-sized packets.
 
-        Bringing the interface down while packets are arriving should cause
-        the NIC/driver to drop incoming frames, incrementing rx_dropped.
-        This is a best-effort approach when tc/iptables aren't available.
+        Sets receiver interface MTU to 576 bytes (minimum IPv4 MTU), then peer sends
+        1400-byte UDP packets. The NIC or driver should drop oversized incoming
+        packets, incrementing rx_dropped. This is a last-resort approach when
+        tc/iptables/ring-manipulation aren't available.
         """
         if ':' in ctx['peer_ip']:
             self.fail(
@@ -458,43 +462,20 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_packets)
 
-        sudo = self._guest_sudo_prefix(ctx['ssh_receiver'])
-        if not sudo:
-            raise unittest.SkipTest(
-                'RX drop induction requires passwordless sudo on receiver guest')
-        iface = self._guest_dataplane_iface(ctx['ssh_receiver'], mac_address)
+        original_mtu = self._set_guest_mtu(ctx['ssh_receiver'], mac_address, 576)
+        self.addCleanup(
+            self._restore_guest_mtu, ctx['ssh_receiver'], mac_address, original_mtu)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(
-            'Inducing receive drops on %s VF %s: toggling %s down/up during flood, '
+            'Inducing receive drops on %s VF %s: MTU=576, receiving 1400-byte packets, '
             '%d UDP datagrams %s -> %s (host rx_dropped=%s)',
-            hypervisor_ip, vf_labels, iface, flood_count, bind_ip,
+            hypervisor_ip, vf_labels, flood_count, bind_ip,
             ctx['peer_ip'], sysfs_before)
-
-        # Start flood in background, then toggle interface
-        import threading
-        flood_done = threading.Event()
-        def flood_worker():
-            self._flood_udp_dataplane(
-                ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count)
-            flood_done.set()
-
-        flood_thread = threading.Thread(target=flood_worker)
-        flood_thread.start()
-        time.sleep(0.5)  # Let flood start
-
-        # Toggle interface down/up a few times
-        for _ in range(3):
-            ctx['ssh_receiver'].exec_command('%s ip link set %s down' % (sudo, iface))
-            time.sleep(0.1)
-            ctx['ssh_receiver'].exec_command('%s ip link set %s up' % (sudo, iface))
-            time.sleep(0.2)
-
-        flood_done.wait(timeout=30)
-        flood_thread.join(timeout=5)
+        self._flood_udp_dataplane(
+            ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count)
         time.sleep(1)
-
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(

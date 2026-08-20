@@ -268,49 +268,15 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             return 'sudo -n'
         return ''
 
-    def _set_hypervisor_vf_rate_limit(self, hypervisor_ip, vf_labels,
-                                      rate_mbps):
-        """Cap (or clear with 0) a VF's egress rate limit in Mbit/s.
-
-        Unlike admin link-state, this keeps the VF fully up on both host
-        and guest, so traffic actually reaches the hardware policer instead
-        of being refused at the carrier layer (driver-dependent behavior
-        that made link-state toggling an unreliable way to induce
-        tx_dropped).
-        """
-        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
-        cmd = 'sudo ip link set dev %s vf %s rate %d' % (
-            pf_netdev, vf_labels['vf'], rate_mbps)
-        self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
-
-    def _get_hypervisor_vf_rate_limit(self, hypervisor_ip, vf_labels):
-        """Return the VF rate limit in Mbit/s, or None if not set/parseable."""
-        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
-        script = (
-            'ip link show dev %s | '
-            'grep -A 5 "vf %s " | '
-            'grep -oP "rate \\K[0-9]+" || echo ""'
-            % (pf_netdev, vf_labels['vf']))
-        result = self._ssh_run_unchecked_on_hypervisor(
-            hypervisor_ip, script).strip()
-        return int(result) if result and result.isdigit() else None
-
-    def _restore_hypervisor_vf_rate_limit(self, hypervisor_ip, vf_labels):
-        """Best-effort clear of the VF rate limit after the transmit drop test."""
-        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
-        self._ssh_run_unchecked_on_hypervisor(
-            hypervisor_ip,
-            'sudo ip link set dev %s vf %s rate 0' % (
-                pf_netdev, vf_labels['vf']))
-
     def _induce_transmit_drops(self, ctx, count, min_packets):
-        """Cap the sender VF egress rate and flood well above it.
+        """Starve the sender VF's TX ring, then flood it with concurrent senders.
 
-        Rate-limiting is a hardware policing feature every SR-IOV driver
-        (ixgbe, i40e, mlx5, bnxt) implements, so excess traffic is reliably
-        dropped and counted in tx_dropped. The VF stays administratively up
-        end-to-end, avoiding the driver-dependent carrier behavior that made
-        link-state toggling an unreliable way to induce drops.
+        Shrinks the guest TX ring to its minimum (32-64 descriptors) and
+        floods well beyond what the ring can hold using multiple concurrent
+        Python threads. The goal is to overflow the TX ring before the NIC
+        can drain it, causing the driver to drop packets and count them in
+        tx_dropped. Every SR-IOV driver counts TX ring overruns as dropped,
+        and the VF stays administratively up throughout.
         """
         sender = ctx['sender']
         hypervisor_ip = sender['hypervisor_ip']
@@ -321,40 +287,25 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         ssh_sender = ctx['ssh_sender']
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_flood_packets)
-        rate_limit_mbps = (
-            CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_rate_mbps)
+        flood_threads = (
+            CONF.nfv_plugin_options.network_exporter_sriov_tx_drop_flood_threads)
 
-        self.addCleanup(
-            self._restore_hypervisor_vf_rate_limit, hypervisor_ip, vf_labels)
         self._maybe_shrink_guest_tx_ring(ssh_sender, mac_address)
-        self._set_hypervisor_vf_rate_limit(
-            hypervisor_ip, vf_labels, rate_limit_mbps)
-        time.sleep(1)
-
-        # Verify rate limit was actually applied
-        actual_rate = self._get_hypervisor_vf_rate_limit(
-            hypervisor_ip, vf_labels)
-        if actual_rate != rate_limit_mbps:
-            LOG.warning(
-                'VF rate limit on %s VF %s: requested %d Mbit/s but got %s '
-                '(may indicate driver limitation or unsupported feature)',
-                hypervisor_ip, vf_labels, rate_limit_mbps,
-                actual_rate if actual_rate else 'none/unparseable')
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
         LOG.warning(
-            'Inducing transmit drops on %s VF %s: rate-limited to %s Mbit/s, '
-            '%d UDP datagrams %s -> %s (host tx_dropped=%s)',
-            hypervisor_ip, vf_labels,
-            actual_rate if actual_rate else 'none',
-            flood_count, bind_ip, peer_ip, sysfs_before)
+            'Inducing transmit drops on %s VF %s: TX ring shrunk, %d UDP '
+            'datagrams from %d concurrent senders %s -> %s '
+            '(host tx_dropped=%s)',
+            hypervisor_ip, vf_labels, flood_count, flood_threads, bind_ip,
+            peer_ip, sysfs_before)
         self._flood_udp_dataplane(
-            ssh_sender, bind_ip, peer_ip, flood_count)
+            ssh_sender, bind_ip, peer_ip, flood_count,
+            threads=flood_threads)
         time.sleep(1)
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
-        self._restore_hypervisor_vf_rate_limit(hypervisor_ip, vf_labels)
         LOG.warning(
             'Transmit drop induce finished on %s VF %s: host tx_dropped '
             'before=%s after=%s',
@@ -645,7 +596,7 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             metrics_base.NET_VF_TRANSMIT_DROPPED_METRIC)
 
     def test_z_net_vf_transmit_dropped_total_increases_with_traffic(self):
-        """Verify net_vf_transmit_dropped_total increases after TX rate-limit."""
+        """Verify net_vf_transmit_dropped_total increases after TX ring overrun."""
         self._test_vf_drop_counter_increases(
             metrics_base.NET_VF_TRANSMIT_DROPPED_METRIC, 'sender',
             traffic_generator=self._induce_transmit_drops,

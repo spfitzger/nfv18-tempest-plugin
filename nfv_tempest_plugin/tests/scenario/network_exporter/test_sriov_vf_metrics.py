@@ -283,6 +283,18 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             pf_netdev, vf_labels['vf'], rate_mbps)
         self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
 
+    def _get_hypervisor_vf_rate_limit(self, hypervisor_ip, vf_labels):
+        """Return the VF rate limit in Mbit/s, or None if not set/parseable."""
+        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
+        script = (
+            'ip link show dev %s | '
+            'grep -A 5 "vf %s " | '
+            'grep -oP "rate \\K[0-9]+" || echo ""'
+            % (pf_netdev, vf_labels['vf']))
+        result = self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip, script).strip()
+        return int(result) if result and result.isdigit() else None
+
     def _restore_hypervisor_vf_rate_limit(self, hypervisor_ip, vf_labels):
         """Best-effort clear of the VF rate limit after the transmit drop test."""
         pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
@@ -319,13 +331,24 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             hypervisor_ip, vf_labels, rate_limit_mbps)
         time.sleep(1)
 
+        # Verify rate limit was actually applied
+        actual_rate = self._get_hypervisor_vf_rate_limit(
+            hypervisor_ip, vf_labels)
+        if actual_rate != rate_limit_mbps:
+            LOG.warning(
+                'VF rate limit on %s VF %s: requested %d Mbit/s but got %s '
+                '(may indicate driver limitation or unsupported feature)',
+                hypervisor_ip, vf_labels, rate_limit_mbps,
+                actual_rate if actual_rate else 'none/unparseable')
+
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
         LOG.warning(
-            'Inducing transmit drops on %s VF %s: rate-limited to %d Mbit/s, '
+            'Inducing transmit drops on %s VF %s: rate-limited to %s Mbit/s, '
             '%d UDP datagrams %s -> %s (host tx_dropped=%s)',
-            hypervisor_ip, vf_labels, rate_limit_mbps, flood_count,
-            bind_ip, peer_ip, sysfs_before)
+            hypervisor_ip, vf_labels,
+            actual_rate if actual_rate else 'none',
+            flood_count, bind_ip, peer_ip, sysfs_before)
         self._flood_udp_dataplane(
             ssh_sender, bind_ip, peer_ip, flood_count)
         time.sleep(1)

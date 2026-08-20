@@ -153,17 +153,20 @@ NfvPluginOptions = [
                     'net_vf_receive_dropped_total, to raise the burst packet '
                     'rate beyond what the receiver VF RX ring can drain.'),
     cfg.IntOpt('network_exporter_sriov_tx_drop_flood_packets',
-               default=10000,
+               default=50000,
                help='UDP datagrams sent from the SR-IOV guest while the '
                     'sender VF egress rate is capped to '
                     'network_exporter_sriov_tx_drop_rate_mbps, to induce '
                     'net_vf_transmit_dropped_total increases on the sender '
                     'VF via hardware rate-limiting.'),
     cfg.IntOpt('network_exporter_sriov_tx_drop_rate_mbps',
-               default=1,
+               default=10,
                help='VF egress rate limit (Mbit/s), set via '
                     '"ip link set vf ... rate", applied to the sender VF '
-                    'while flooding traffic for net_vf_transmit_dropped_total.'),
+                    'while flooding traffic for net_vf_transmit_dropped_total. '
+                    'Must be high enough that the NIC accepts it (many drivers '
+                    'require >=10 Mbps) but low enough that a Python UDP flood '
+                    'exceeds it.'),
     cfg.IntOpt('network_exporter_sriov_broadcast_flood_packets',
                default=150,
                help='UDP datagrams sent to the SR-IOV subnet broadcast address '

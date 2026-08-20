@@ -323,16 +323,37 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             cmd = '%s %s' % (sudo, cmd)
         return ssh_client.exec_command(cmd)
 
+    def _get_guest_ring_size(self, ssh_client, mac_address, direction):
+        """Get current RX or TX ring size for the guest dataplane interface."""
+        sudo = self._guest_sudo_prefix(ssh_client)
+        if not sudo:
+            return None
+        iface = self._guest_dataplane_iface(ssh_client, mac_address)
+        output = ssh_client.exec_command(
+            '%s ethtool -g %s 2>/dev/null || echo ""' % (sudo, iface))
+        # Parse "Current hardware settings:\nRX:\t\t64" format
+        for line in output.splitlines():
+            if direction.upper() in line and line.strip().startswith(direction.upper()):
+                parts = line.split()
+                if len(parts) >= 2 and parts[-1].isdigit():
+                    return int(parts[-1])
+        return None
+
     def _maybe_shrink_guest_rx_ring(self, ssh_client, mac_address):
         """Temporarily shrink RX ring on guest SR-IOV NIC to ease RX drops."""
         sudo = self._guest_sudo_prefix(ssh_client)
         if not sudo:
             return None
         iface = self._guest_dataplane_iface(ssh_client, mac_address)
+        before = self._get_guest_ring_size(ssh_client, mac_address, 'rx')
         ssh_client.exec_command(
             '%s ethtool -G %s rx 32 2>/dev/null || '
             '%s ethtool -G %s rx 64 2>/dev/null || true' % (
                 sudo, iface, sudo, iface))
+        after = self._get_guest_ring_size(ssh_client, mac_address, 'rx')
+        LOG.warning(
+            'Guest %s RX ring size: before=%s after=%s',
+            iface, before, after)
 
         def restore():
             ssh_client.exec_command(
@@ -348,10 +369,15 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         if not sudo:
             return None
         iface = self._guest_dataplane_iface(ssh_client, mac_address)
+        before = self._get_guest_ring_size(ssh_client, mac_address, 'tx')
         ssh_client.exec_command(
             '%s ethtool -G %s tx 32 2>/dev/null || '
             '%s ethtool -G %s tx 64 2>/dev/null || true' % (
                 sudo, iface, sudo, iface))
+        after = self._get_guest_ring_size(ssh_client, mac_address, 'tx')
+        LOG.warning(
+            'Guest %s TX ring size: before=%s after=%s',
+            iface, before, after)
 
         def restore():
             ssh_client.exec_command(

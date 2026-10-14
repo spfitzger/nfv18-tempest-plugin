@@ -254,8 +254,15 @@ MEMORY_SHOW_COMMANDS = (
 OVN_COVERAGE_TOTAL_RE = re.compile(
     r'^(\w+)\s+.*\s+total:\s*(\d+)\s*$')
 OVN_COVERAGE_METRICS_DELIMITER = '---OVN_COVERAGE_METRICS---'
+# On RHOSO EDPM ovn-controller runs in the ``ovn_controller`` podman
+# container with its runtime socket under /var/run/ovn, so the host ovs-appctl
+# cannot reach it; fall back to running appctl inside the container.
 OVN_COVERAGE_SHOW_COMMANDS = (
     'sudo ovs-appctl -t ovn-controller coverage/show 2>/dev/null',
+    'ovs-appctl -t ovn-controller coverage/show 2>/dev/null',
+    'sudo podman exec ovn_controller ovn-appctl -t ovn-controller '
+    'coverage/show 2>/dev/null',
+    'sudo podman exec ovn_controller env OVS_RUNDIR=/var/run/ovn '
     'ovs-appctl -t ovn-controller coverage/show 2>/dev/null',
 )
 OVS_EXTERNAL_ID_RE = re.compile(r'([\w-]+)="([^"]*)"')

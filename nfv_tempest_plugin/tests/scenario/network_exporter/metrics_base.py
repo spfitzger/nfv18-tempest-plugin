@@ -204,6 +204,8 @@ NET_VF_METRIC_TO_SYSFS_STAT = {
 }
 # OVN/K8s service metrics (northd, controller, etc.), not compute :9105
 OVN_K8S_METRICS_PORT = ':1981'
+# Namespace the RHOSO control plane (and the ovn-controller-metrics pods) run in.
+OPENSTACK_NAMESPACE = 'openstack'
 OVN_CONTROLLER_METRICS_POD_RE = r'ovn-controller-metrics.*'
 OVN_CONTROLLER_METRICS_CONTAINER = 'ovn-controller-metrics'
 OVN_CONTROLLER_METRICS_CURL = (

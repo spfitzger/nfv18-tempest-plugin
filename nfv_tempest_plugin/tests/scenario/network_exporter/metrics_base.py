@@ -493,8 +493,22 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             hypervisor_ip, OVN_CONTROLLER_METRICS_CURL)
 
     def _ovn_controller_metrics_pods(self):
-        return self.k8s_client.search_pods_using_regex(
-            OVN_CONTROLLER_METRICS_POD_RE, OPENSTACK_NAMESPACE)
+        """Best-effort list of ovn-controller-metrics pods.
+
+        The pod scrape is only a fallback; the ovnc_* metrics are normally
+        read from the compute :9105 exposition. If the tempest serviceaccount
+        lacks RBAC to list pods (403 Forbidden) or the Kubernetes API is
+        otherwise unreachable, degrade to an empty list so the primary scrape
+        still succeeds instead of failing the whole metric check.
+        """
+        try:
+            return self.k8s_client.search_pods_using_regex(
+                OVN_CONTROLLER_METRICS_POD_RE, OPENSTACK_NAMESPACE)
+        except Exception as exc:
+            LOG.warning(
+                'ovn-controller-metrics pod lookup failed (%s); skipping pod '
+                'scrape fallback', exc)
+            return []
 
     def _scrape_ovn_controller_metrics_pod(self, hypervisor_ip=None):
         """Scrape ovn-controller-metrics :1981 via pod exec."""

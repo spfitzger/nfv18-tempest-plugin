@@ -552,11 +552,21 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         return ''
 
     def _ovn_metric_scrape_outputs(self, hypervisor_ip=None):
-        """Yield Prometheus text from OVN :1981 sources (node-local then pod)."""
+        """Yield Prometheus text exposing OVN controller (ovnc_*) metrics.
+
+        The openstack-network-exporter serves the ovnc_* metrics on the
+        compute :9105 exposition (the same endpoint as the OVS/net_vf
+        metrics), so that is tried first. A separate OVN :1981 endpoint
+        (node-local then pod) is kept as a fallback for deployments that
+        expose OVN metrics there instead.
+        """
         if hypervisor_ip:
+            compute_output = self._scrape_compute_metrics_text(hypervisor_ip)
+            if compute_output.strip():
+                yield ('compute:%s:9105' % hypervisor_ip, compute_output)
             output = self._scrape_ovn_metrics_text(hypervisor_ip)
             if output.strip():
-                yield ('compute:%s' % hypervisor_ip, output)
+                yield ('compute:%s:1981' % hypervisor_ip, output)
         pod_output = self._scrape_ovn_controller_metrics_pod(hypervisor_ip)
         if pod_output.strip():
             yield ('ovn-controller-metrics', pod_output)

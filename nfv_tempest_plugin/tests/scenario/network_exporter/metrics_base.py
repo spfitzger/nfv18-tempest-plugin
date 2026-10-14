@@ -1982,14 +1982,21 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         return max(sample['value'] for sample in samples)
 
     def _ovn_coverage_and_live_output(self, hypervisor_ip):
-        """Fetch coverage/show and :1981 metrics in one SSH round-trip."""
+        """Fetch ovn-controller coverage/show and the live :9105 metrics.
+
+        coverage/show is read inside the ovn_controller container as a fallback
+        (its runtime socket is under /var/run/ovn on RHOSO EDPM, unreachable
+        from the host), and the live ovnc_* metrics come from the compute
+        :9105 exposition (there is no OVN :1981 endpoint on these nodes).
+        """
         cmd = (
             "COVERAGE=$(sudo ovs-appctl -t ovn-controller coverage/show "
             "2>/dev/null || ovs-appctl -t ovn-controller coverage/show "
-            "2>/dev/null); "
+            "2>/dev/null || sudo podman exec ovn_controller ovn-appctl "
+            "-t ovn-controller coverage/show 2>/dev/null); "
             "printf '%%s\\n%s\\n' \"$COVERAGE\" '%s'; "
-            "curl -sk https://127.0.0.1:1981/metrics 2>/dev/null || "
-            "curl -s http://127.0.0.1:1981/metrics 2>/dev/null"
+            "curl -sk https://127.0.0.1:9105/metrics 2>/dev/null || "
+            "curl -s http://127.0.0.1:9105/metrics 2>/dev/null"
             % (OVN_COVERAGE_METRICS_DELIMITER,
                OVN_COVERAGE_METRICS_DELIMITER))
         return self._ssh_run_on_hypervisor(hypervisor_ip, cmd, check_rc=False)

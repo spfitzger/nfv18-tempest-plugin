@@ -68,7 +68,7 @@ class TestOvncTxnMetrics(metrics_base.NetworkExporterMetricsBase):
 
         network_name = 'tempest-ovnc-txn-%s' % uuid.uuid4().hex[:8]
         network = self.os_admin.networks_client.create_network(
-            body={'network': {'name': network_name}})['network']
+            name=network_name)['network']
         self.addCleanup(
             self.os_admin.networks_client.delete_network, network['id'])
 

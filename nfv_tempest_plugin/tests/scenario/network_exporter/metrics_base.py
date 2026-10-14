@@ -2171,11 +2171,19 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             reported = self._ovnc_live_metric_value(
                 hypervisor_ip, metric_name, metrics_output=metrics_output)
             try:
-                self.assertEqual(
-                    expected, reported,
-                    '%s on %s: coverage/show %s=%s live=%s' % (
-                        metric_name, hypervisor_ip, coverage_key,
-                        expected, reported))
+                # ovnc_txn_* are cumulative counters. The exporter value is a
+                # cached snapshot from its last scrape cycle, while coverage/show
+                # is read live here, so for a busy counter (e.g. txn_success) the
+                # live total runs ahead of the exporter snapshot and they will
+                # not be exactly equal. Assert the exporter snapshot does not
+                # exceed the current coverage total (it can only lag); the
+                # companion *_increases test validates that it tracks changes.
+                self.assertLessEqual(
+                    reported, expected,
+                    '%s on %s: exporter live=%s exceeds coverage/show %s=%s '
+                    '(exporter snapshot should only lag the live counter)' % (
+                        metric_name, hypervisor_ip, reported, coverage_key,
+                        expected))
                 LOG.warning(
                     'OVN txn %s aligned with coverage/show on %s (attempt %s): '
                     'show=%s live=%s',

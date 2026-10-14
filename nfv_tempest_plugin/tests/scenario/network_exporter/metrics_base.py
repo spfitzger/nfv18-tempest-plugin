@@ -265,7 +265,22 @@ OVN_COVERAGE_SHOW_COMMANDS = (
     'sudo podman exec ovn_controller env OVS_RUNDIR=/var/run/ovn '
     'ovs-appctl -t ovn-controller coverage/show 2>/dev/null',
 )
-OVS_EXTERNAL_ID_RE = re.compile(r'([\w-]+)="([^"]*)"')
+# ovs-vsctl prints external_ids values either quoted ("ssl:...", or quoted
+# lists that contain commas like ovn-bridge-mappings) or bare/unquoted
+# (ovn-encap-type=geneve, ovn-monitor-all=True). Capture both: group 2 is the
+# quoted value (may contain commas), group 3 the bare value (up to the next
+# comma or closing brace).
+OVS_EXTERNAL_ID_RE = re.compile(r'([\w-]+)=(?:"([^"]*)"|([^",}]+))')
+
+
+def _parse_ovs_external_ids(output):
+    """Parse ``ovs-vsctl get Open_vSwitch . external_ids`` output into a dict.
+
+    Handles quoted and unquoted values; an earlier quoted-only pattern silently
+    dropped bare keys such as ovn-encap-type and ovn-monitor-all.
+    """
+    return {key: (quoted or unquoted)
+            for key, quoted, unquoted in OVS_EXTERNAL_ID_RE.findall(output)}
 PMD_RXQ_OVERHEAD_RE = re.compile(r'^\s*overhead\s*:\s*([\d.]+)\s*%$')
 PMD_RXQ_USAGE_RE = re.compile(
     r'^\s*port:\s*(\S+)\s+queue-id:\s*(\d+)\s+\((enabled|disabled)\)\s+'
@@ -1896,7 +1911,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             output = self._ssh_run_on_hypervisor(
                 hypervisor_ip, cmd, check_rc=False)
             if output and output.strip():
-                return dict(OVS_EXTERNAL_ID_RE.findall(output))
+                return _parse_ovs_external_ids(output)
             last_output = output or last_output
         self.fail(
             'Could not get Open_vSwitch external_ids on %s (last output: %r)' % (
@@ -1997,7 +2012,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     output = self._ssh_run_on_hypervisor(
                         hypervisor_ip, cmd, check_rc=False)
                     if output.strip():
-                        ext_ids = dict(OVS_EXTERNAL_ID_RE.findall(output))
+                        ext_ids = _parse_ovs_external_ids(output)
                         if ext_ids.get('ovn-remote'):
                             found.append(hypervisor_ip)
                             break

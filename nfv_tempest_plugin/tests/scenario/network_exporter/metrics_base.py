@@ -212,9 +212,12 @@ OVN_CONTROLLER_METRICS_CURL = (
     'curl -sk https://127.0.0.1:1981/metrics 2>/dev/null || '
     'curl -s http://127.0.0.1:1981/metrics 2>/dev/null')
 PROM_NUMBER_RE = r'-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?'
+# The label block is optional: unlabeled series such as "ovnc_monitor_all 1"
+# or "ovnc_txn_success 698" have no {...}. Requiring braces previously dropped
+# every unlabeled sample.
 PROM_METRIC_LINE_RE = re.compile(
     r'^(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'
-    r'\{(?P<labels>[^}]*)\}\s+'
+    r'(?:\{(?P<labels>[^}]*)\})?\s+'
     r'(?P<value>' + PROM_NUMBER_RE + r')$')
 PROM_LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 # openstack-network-exporter: 0=standby, 1=active, 2=paused
@@ -1635,7 +1638,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             match = PROM_METRIC_LINE_RE.match(line.strip())
             if not match or match.group('metric') != metric_name:
                 continue
-            labels = dict(PROM_LABEL_RE.findall(match.group('labels')))
+            labels = dict(PROM_LABEL_RE.findall(match.group('labels') or ''))
             if required_labels and any(
                     labels.get(key) != value
                     for key, value in required_labels.items()):
@@ -2950,7 +2953,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             match = PROM_METRIC_LINE_RE.match(line.strip())
             if not match or match.group('metric') != metric_name:
                 continue
-            labels = dict(PROM_LABEL_RE.findall(match.group('labels')))
+            labels = dict(PROM_LABEL_RE.findall(match.group('labels') or ''))
             if required_labels and any(
                     labels.get(key) != value
                     for key, value in required_labels.items()):

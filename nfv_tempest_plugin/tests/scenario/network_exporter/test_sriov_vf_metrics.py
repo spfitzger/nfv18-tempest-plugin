@@ -635,6 +635,17 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
                 "VMs; the OVN Southbound enrichment is degraded to empty "
                 "labels on this deployment (SB DB unreachable) or the exporter "
                 "predates the feature.")
+        # SB enrichment is reachable (at least one label populated), so every
+        # enrichment label is expected to populate. A label that stayed empty
+        # here is an exporter/Port_Binding gap (e.g. vm_id regression), not SB
+        # degradation, so fail rather than pass on partial enrichment.
+        missing = set(metrics_base.NET_VF_INFO_ENRICHMENT_LABELS) - verified
+        self.assertFalse(
+            missing,
+            "net_vf_info verified %s but not %s for the test VMs; the SB "
+            "enrichment is reachable (some labels populated), so the missing "
+            "label(s) indicate an exporter/Port_Binding gap rather than SB "
+            "degradation." % (sorted(verified), sorted(missing)))
 
     def test_net_vf_guest_dataplane_mac_matches_port(self):
         """Verify each VM SR-IOV dataplane NIC MAC matches its Neutron port."""

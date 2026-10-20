@@ -1170,6 +1170,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         router_port_ids = self._neutron_router_port_ids()
         verified = []
         stale = []
+        port_id_verified = False
         for sample in enriched:
             labels = sample['labels']
             router_id = labels.get('router_id')
@@ -1190,12 +1191,26 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 stale.append(('port_id', port_id, labels))
                 continue
             verified.append(sample)
+            if port_id and router_port_ids and port_id in router_port_ids:
+                port_id_verified = True
         if not verified:
             raise unittest.SkipTest(
                 '%s exposed enrichment labels but no series mapped to current '
                 'Neutron resources; all %d enriched sample(s) were stale '
                 '(metric-storage retention / OVN-Neutron churn): %s' % (
                     metric_name, len(enriched), stale[:5]))
+        # Require the port_id value itself to be validated on at least one
+        # series (not only router_id/router_name). An empty port_id while
+        # router_id is populated means SB is reachable but the Port_Binding
+        # join did not yield the gateway/interface port UUID (Req 3 gap).
+        if router_port_ids:
+            self.assertTrue(
+                port_id_verified,
+                '%s verified router_id/router_name but no series carried a '
+                'port_id mapping to a current Neutron router port; expected '
+                'the gateway/interface port UUID. Verified labels: %s' % (
+                    metric_name,
+                    [sample['labels'] for sample in verified][:5]))
         LOG.warning(
             '%s Neutron-context labels verified for %d series (%d stale '
             'skipped; routers %s)',

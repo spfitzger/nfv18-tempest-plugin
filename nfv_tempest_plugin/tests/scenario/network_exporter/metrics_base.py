@@ -25,6 +25,7 @@ import requests
 import urllib3
 from tempest import config
 
+from nfv_tempest_plugin.tests.common import k8s
 from nfv_tempest_plugin.tests.scenario import base_test
 from oslo_log import log as logging
 
@@ -198,6 +199,14 @@ NET_VF_ALL_METRICS = (
     NET_VF_BROADCAST_PACKETS_METRIC,
     NET_VF_MULTICAST_PACKETS_METRIC,
 )
+# Neutron/Nova context enrichment labels on net_vf_info: port_id comes from
+# the OVN Southbound Port_Binding logical_port and vm_id from Port_Binding
+# external_ids "neutron:device_id". The exporter joins the VF MAC to the
+# Port_Binding MAC; when the OVN Southbound DB is unreachable these degrade to
+# empty strings. Unlike metric-storage (Prometheus drops empty-valued labels
+# on ingestion), the compute :9105 exposition keeps the label keys, so schema
+# checks read it.
+NET_VF_INFO_ENRICHMENT_LABELS = ('port_id', 'vm_id')
 # Host sysfs under .../sriov/vfN/stats/ (same source as net_vf exporter).
 NET_VF_METRIC_TO_SYSFS_STAT = {
     NET_VF_RECEIVE_PACKETS_METRIC: 'rx_packets',

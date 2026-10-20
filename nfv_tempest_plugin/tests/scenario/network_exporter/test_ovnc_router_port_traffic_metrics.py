@@ -352,13 +352,48 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
     # --- Presence ---
 
+    def _ensure_router_port_traffic(self):
+        """Create an isolated router + two VMs and drive cross-subnet traffic
+        so the ovnc_router_port_traffic_* counters are populated.
+
+        Makes the presence/enrichment tests self-contained instead of relying
+        on pre-existing router traffic. Resources are created via
+        create_and_verify_resources on the router (non-direct) test-networks
+        with unique names and automatic cleanup, so they do not collide with
+        the SR-IOV net_vf workload or any other test. Returns the hypervisor
+        IP that carried the traffic.
+        """
+        servers, key_pair = self._boot_router_traffic_vms()
+        self.assertEqual(2, len(servers), 'Test requires exactly two VMs')
+        if not servers[0].get('provider_networks'):
+            if self.test_all_provider_networks and servers[0].get('fip'):
+                self.verify_provider_networks(servers, key_pair)
+            else:
+                self._populate_provider_networks(servers)
+        sender, receiver = servers[0], servers[1]
+        ssh_sender = self.get_remote_client(
+            sender['fip'], self.instance_user, key_pair['private_key'])
+        ssh_receiver = self.get_remote_client(
+            receiver['fip'], self.instance_user, key_pair['private_key'])
+        endpoints = self._router_traffic_endpoints(
+            ssh_sender, ssh_receiver, sender, receiver)
+        if not endpoints:
+            raise unittest.SkipTest(
+                'No cross-subnet IPs between VMs for %s; cannot drive '
+                'router-port traffic' % self.TEST_NAME)
+        self._send_router_cross_subnet_traffic(
+            endpoints, self._traffic_ping_count())
+        return sender['hypervisor_ip']
+
     def test_ovnc_router_port_traffic_pkts_reported(self):
         """Verify ovnc_router_port_traffic_pkts in metric-storage."""
+        self._ensure_router_port_traffic()
         self._assert_router_port_metric_reported(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
 
     def test_ovnc_router_port_traffic_bytes_reported(self):
         """Verify ovnc_router_port_traffic_bytes in metric-storage."""
+        self._ensure_router_port_traffic()
         self._assert_router_port_metric_reported(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
@@ -366,21 +401,25 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
     def test_ovnc_router_port_traffic_pkts_exposes_neutron_context_labels(self):
         """Verify ovnc_router_port_traffic_pkts carries the SB enrichment labels."""
+        self._ensure_router_port_traffic()
         self._assert_router_port_enrichment_labels_exposed(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
 
     def test_ovnc_router_port_traffic_bytes_exposes_neutron_context_labels(self):
         """Verify ovnc_router_port_traffic_bytes carries the SB enrichment labels."""
+        self._ensure_router_port_traffic()
         self._assert_router_port_enrichment_labels_exposed(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
     def test_ovnc_router_port_traffic_pkts_labels_match_neutron(self):
         """Verify router_id/router_name/port_id map to real Neutron resources."""
+        self._ensure_router_port_traffic()
         self._assert_router_port_labels_match_neutron(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
 
     def test_ovnc_router_port_traffic_bytes_labels_match_neutron(self):
         """Verify router_id/router_name/port_id map to real Neutron resources."""
+        self._ensure_router_port_traffic()
         self._assert_router_port_labels_match_neutron(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
